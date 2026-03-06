@@ -1,0 +1,172 @@
+name: Notify ZenBlog
+
+on:
+  push:
+    paths:
+      - 'entries/**/*.json'
+  workflow_dispatch:
+    inputs:
+      entry_path:
+        description: '要触发同步的 entry 路径，例如 entries/2026/2026-03-06.json'
+        required: true
+        type: string
+
+jobs:
+  validate-and-dispatch:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout bubble-build
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install ajv-cli
+        run: npm install --global ajv-cli ajv-formats
+
+      - name: Resolve changed entries
+        id: entries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENTRY_PATH="${{ inputs.entry_path }}"
+            if [ ! -f "$ENTRY_PATH" ]; then
+              echo "Entry file not found: $ENTRY_PATH"
+              exit 1
+            fi
+
+            {
+              echo "files<<EOF"
+              echo "$ENTRY_PATH"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            FILES=$(git ls-files 'entries/**/*.json')
+          else
+            FILES=$(git diff --name-only --diff-filter=AM "$BEFORE_SHA" "$AFTER_SHA" -- 'entries/**/*.json')
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "No changed entry files found."
+            {
+              echo "files<<EOF"
+              echo ""
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "files<<EOF"
+            printf '%s\n' "$FILES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate changed entries
+        if: steps.entries.outputs.files != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+
+            echo "Validating schema: $entry"
+            ajv validate \
+              -s schemas/diary-entry.schema.json \
+              -d "$entry" \
+              --spec=draft7 \
+              -c ajv-formats
+
+            echo "Running business validation: $entry"
+            node --input-type=module -e '
+              import fs from "fs";
+
+              const filePath = process.argv[1];
+              const raw = fs.readFileSync(filePath, "utf8");
+              const entry = JSON.parse(raw);
+
+              if (entry.entry_id !== `bubble-${entry.date}`) {
+                console.error(
+                  `entry_id/date mismatch in ${filePath}: expected bubble-${entry.date}, got ${entry.entry_id}`
+                );
+                process.exit(1);
+              }
+
+              console.log(`Business validation passed: ${filePath}`);
+            ' "$entry"
+          done <<< "${{ steps.entries.outputs.files }}"
+
+      - name: Dispatch to ZenBlog
+        if: steps.entries.outputs.files != ''
+        env:
+          ZENBLOG_DISPATCH_TOKEN: ${{ secrets.ZENBLOG_DISPATCH_TOKEN }}
+          ZENBLOG_OWNER: ${{ vars.ZENBLOG_OWNER }}
+          ZENBLOG_REPO: ${{ vars.ZENBLOG_REPO }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZENBLOG_DISPATCH_TOKEN:-}" ]; then
+            echo "Missing secret: ZENBLOG_DISPATCH_TOKEN"
+            exit 1
+          fi
+
+          if [ -z "${ZENBLOG_OWNER:-}" ]; then
+            echo "Missing variable: ZENBLOG_OWNER"
+            exit 1
+          fi
+
+          if [ -z "${ZENBLOG_REPO:-}" ]; then
+            echo "Missing variable: ZENBLOG_REPO"
+            exit 1
+          fi
+
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+
+            entry_id=$(node --input-type=module -e '
+              import fs from "fs";
+              const raw = fs.readFileSync(process.argv[1], "utf8");
+              const data = JSON.parse(raw);
+              process.stdout.write(data.entry_id);
+            ' "$entry")
+
+            payload=$(node --input-type=module -e '
+              const entryPath = process.argv[1];
+              const entryId = process.argv[2];
+              process.stdout.write(JSON.stringify({
+                event_type: "bubble-build-sync",
+                client_payload: {
+                  entry_path: entryPath,
+                  entry_id: entryId,
+                  overwrite: false
+                }
+              }));
+            ' "$entry" "$entry_id")
+
+            echo "Dispatching $entry_id to ${ZENBLOG_OWNER}/${ZENBLOG_REPO}"
+
+            curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${ZENBLOG_DISPATCH_TOKEN}" \
+              https://api.github.com/repos/${ZENBLOG_OWNER}/${ZENBLOG_REPO}/dispatches \
+              -d "$payload"
+          done <<< "${{ steps.entries.outputs.files }}"
